@@ -1,6 +1,7 @@
 
 #include <arpa/inet.h>
 #include <assert.h>
+#include <linux/if_packet.h>
 #include <net/ethernet.h>
 #include <netinet/if_ether.h>
 #include <netinet/ip.h>
@@ -9,25 +10,47 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+
+#include "all.h"
+
+// todo:
+// 1.measure rtt. trickier than you might expect,
+// with tcp it's the time for sending SYN, receiving SYN+ACK, and then sending ACK
+// simply measuring from DATA to ACK is not enough, if we're on capturing host that's receiving
+// that only measures the time spent processing
+// technique: measure the time between the first DATA packet and the 11th data packet
 
 struct sockaddr_storage source;
 struct sockaddr_storage dest;
 
 char source_name[INET6_ADDRSTRLEN];
 char dest_name[INET6_ADDRSTRLEN];
-char source_port_name[10];
-char dest_port_name[10];
 
 struct iphdr *ip;
 struct ip6_hdr *ip6;
 struct udphdr *udp;
 struct ethhdr *eth;
 
+// output is grouped into triplets of lines: a prefix, the line itself, and a suffix.
+// output_prefix(), output(), and output_suffix() are used to write to these buffers.
 char line_buf[0x4000];
 char *line;
 int linelen;
+
+char prefix_buf[0x4000];
+char *prefix;
+int prefixlen;
+
+char suffix_buf[0x4000];
+char *suffix;
+int suffixlen;
+
+struct {
+    bool print_packet_bytes;
+} opts;
 
 void
 output (char *fmt, ...) {
@@ -41,33 +64,170 @@ output (char *fmt, ...) {
 }
 
 void
+output_prefix (char *fmt, ...) {
+    va_list ap;
+
+    va_start(ap, fmt);
+    prefixlen += vsnprintf(prefix, sizeof(prefix_buf) - prefixlen, fmt, ap);
+    prefix = prefix_buf + prefixlen;
+
+    va_end(ap);
+}
+
+void
+output_suffix (char *fmt, ...) {
+    va_list ap;
+
+    va_start(ap, fmt);
+    suffixlen += vsnprintf(suffix, sizeof(suffix_buf) - suffixlen, fmt, ap);
+    suffix = suffix_buf + suffixlen;
+
+    va_end(ap);
+}
+
+void
 final_output () {
-    printf("%.*s\n", linelen, line_buf);
+    if (prefixlen) {
+        printf("%.*s\n", prefixlen, prefix_buf);
+    }
+
+    if (linelen) {
+        printf("%.*s\n", linelen, line_buf);
+    }
+
+    if (suffixlen) {
+        printf("%.*s\n", suffixlen, suffix_buf);
+    }
+    prefixlen = 0;
+    linelen = 0;
+    suffixlen = 0;
 }
 
 typedef struct udx_stream_s udx_stream_t;
 typedef struct udx_flow_s udx_flow_t;
 
 struct udx_flow_s {
-    udx_stream_t *parent;
+    char addr[INET6_ADDRSTRLEN];
+    uint16_t port;
+    bool complete; // we have seen the remote id in this direction
+    uint32_t id;
+
     uint32_t seq;
     uint32_t ack;
-    uint32_t id;
     uint32_t rwnd;
 
-    udx_flow_t *next;
+    int retransmits;
+
+    udx_cirbuf_t outgoing;
+    // udx_cirbuf_t incoming_out_of_order; // todo
+
+    struct {
+        uint32_t start;
+        uint32_t end;
+    } sacks[32];
+    int nsacks;
 };
+
+// the tw flows are arbitrarily ordered by lexical
+// ordering of the source address
 
 struct udx_stream_s {
     udx_flow_t flow[2];
 
-    udx_flow_t *fwd;
-    udx_flow_t *rev;
+    udx_flow_t *fwd; // points to the flow that is sending data
+    udx_flow_t *rev; // points to the flow acking data.
+                     // these may flip whenever data is sent bidirectionally
+
+    udx_stream_t *hash_next;
 };
 
-udx_flow_t *flow_table[1024];
-udx_flow_t flows[1024];
-int nflows;
+#define HASH_SIZE 1024
+udx_stream_t *stream_table[HASH_SIZE];
+
+bool
+stream_equal (udx_stream_t *stream, char *saddr, uint16_t sport, char *daddr, uint16_t dport, uint32_t remote_id) {
+
+    if (strcmp(saddr, daddr) < 0 || (strcmp(saddr, daddr) == 0 && sport < dport)) {
+        if (strcmp(stream->flow[0].addr, saddr) == 0 && stream->flow[0].port == sport &&
+            strcmp(stream->flow[1].addr, daddr) == 0 && stream->flow[1].port == dport) {
+            if (stream->flow[1].complete) {
+                return stream->flow[1].id == remote_id;
+            } else {
+                stream->flow[1].complete = true;
+                stream->flow[1].id = remote_id;
+                output_suffix("\t(identified stream: %s:%d.%d <-> %s:%d.%d)", stream->flow[0].addr, stream->flow[0].port, stream->flow[0].id, stream->flow[1].addr, stream->flow[1].port, stream->flow[1].id);
+                return true;
+            }
+        }
+    } else {
+        if (strcmp(stream->flow[0].addr, daddr) == 0 && stream->flow[0].port == dport &&
+            strcmp(stream->flow[1].addr, saddr) == 0 && stream->flow[1].port == sport) {
+            if (stream->flow[0].complete) {
+                return stream->flow[0].id == remote_id;
+            } else {
+                stream->flow[0].complete = true;
+                stream->flow[0].id = remote_id;
+                output_suffix("\t(identified stream: %s:%d.%d <-> %s:%d.%d)", stream->flow[0].addr, stream->flow[0].port, stream->flow[0].id, stream->flow[1].addr, stream->flow[1].port, stream->flow[1].id);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+udx_stream_t *
+lookup (char *saddr, uint16_t sport, char *daddr, uint16_t dport, uint32_t id) {
+    uint32_t key;
+
+    if (sport < dport) {
+        key = (dport * sport) % 1021;
+    } else {
+        key = (sport * dport) % 1021;
+    }
+
+    udx_stream_t **pstream = &stream_table[key];
+
+    int depth = 0;
+
+    for (;;) {
+        udx_stream_t *stream = *pstream;
+        if (stream == NULL) break;
+        if (stream_equal(stream, saddr, sport, daddr, dport, id)) {
+            return stream;
+        } else {
+            depth++;
+            pstream = &stream->hash_next;
+        }
+    }
+
+    // not found
+    udx_stream_t *stream = calloc(1, sizeof(*stream));
+
+    // impose an order on the flows so that can compare them
+    if (strcmp(saddr, daddr) < 0 || (strcmp(saddr, daddr) == 0 && sport < dport)) {
+        memcpy(stream->flow[0].addr, saddr, INET6_ADDRSTRLEN);
+        stream->flow[0].port = sport;
+        memcpy(stream->flow[1].addr, daddr, INET6_ADDRSTRLEN);
+        stream->flow[1].port = dport;
+        stream->flow[1].id = id;
+        stream->flow[1].complete = true;
+    } else {
+        memcpy(stream->flow[0].addr, daddr, INET6_ADDRSTRLEN);
+        stream->flow[0].port = dport;
+        memcpy(stream->flow[1].addr, saddr, INET6_ADDRSTRLEN);
+        stream->flow[1].port = sport;
+        stream->flow[0].id = id;
+        stream->flow[0].complete = true;
+    }
+    *pstream = stream;
+
+    udx__cirbuf_init(&stream->flow[0].outgoing, 16);
+    udx__cirbuf_init(&stream->flow[1].outgoing, 16);
+
+    output_suffix("\t(new stream %s:%d -> %s:%d.%d)", saddr, sport, daddr, dport, id);
+
+    return stream;
+}
 
 typedef struct dht_request_s dht_request_t;
 
@@ -102,29 +262,6 @@ add_dht_request (int tid, bool internal, int command) {
     return &pending[npending++];
 }
 
-udx_flow_t *
-lookup_or_create_flow (uint32_t id) {
-    uint32_t key = id & 0x3ff;
-
-    udx_flow_t **pflow = &flow_table[key];
-
-    for (;;) {
-        udx_flow_t *flow = *pflow;
-        if (flow == NULL) break;
-
-        if (flow->id == id) {
-            return flow;
-        } else {
-            pflow = &flow->next;
-        }
-    }
-
-    udx_flow_t *flow = &flows[nflows++];
-    flow->id = id;
-    *pflow = flow;
-    return flow;
-}
-
 // each parsing function passes a payload to the start of it's header
 void
 parse_ipv4 (uint8_t *payload, int len);
@@ -138,8 +275,17 @@ void
 parse_udx (uint8_t *payload, int len);
 
 int
-main () {
+main (int argc, char **argv) {
 
+    opts.print_packet_bytes = false;
+    for (int i = 0; i < argc; i++) {
+        if (argv[i][0] == '-') {
+            if (argv[i][1] == 'v') {
+                opts.print_packet_bytes = true;
+                continue;
+            }
+        }
+    }
     // int fd = socket(PF_INET, SOCK_RAW, IPPROTO_UDP);
     int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
 
@@ -147,33 +293,53 @@ main () {
         perror("socket");
         return 1;
     }
+
+    int rcvbuf_size = 212992;
+
+    int rc = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
+    if (rc == -1) {
+        perror("setsockopt");
+        return 1;
+    }
+
     uint8_t buf[2048];
-    struct iovec iov;
-    iov.iov_base = buf;
-    iov.iov_len = sizeof(buf);
+    // struct iovec iov;
+    // iov.iov_base = buf;
+    // iov.iov_len = sizeof(buf);
 
-    union {
-        struct cmsghdr align;
-        uint8_t buf[2048];
-    } cmsg;
+    // union {
+    //     struct cmsghdr align;
+    //     uint8_t buf[2048];
+    // } cmsg;
 
-    struct msghdr m;
+    // struct msghdr m;
 
-    m.msg_name = &source;
-    m.msg_namelen = sizeof(source);
-    m.msg_iov = &iov;
-    m.msg_iovlen = 1;
-    m.msg_control = &cmsg;
-    m.msg_controllen = sizeof(cmsg);
+    struct sockaddr_ll addr_ll;
+
+    // m.msg_name = &addr_ll;
+    // m.msg_namelen = sizeof(addr_ll);
+    // m.msg_iov = &iov;
+    // m.msg_iovlen = 1;
+    // m.msg_control = &cmsg;
+    // m.msg_controllen = sizeof(cmsg);
 
     while (1) {
         socklen_t addrlen;
-        // ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *) &source, &addrlen);
+        ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *) &addr_ll, &addrlen);
 
-        ssize_t n = recvmsg(fd, &m, 0);
+        // todo: select on our fd + STDIN to change modes
+        // ssize_t n = recvmsg(fd, &m, 0);
+
+        // prevent duplicate packets on loopback interface
+        // assumes loopback is ifindex 1
+        if (addr_ll.sll_ifindex == 1 && addr_ll.sll_pkttype == PACKET_OUTGOING) continue;
 
         line = line_buf;
         linelen = 0;
+        prefix = prefix_buf;
+        prefixlen = 0;
+        suffix = suffix_buf;
+        suffixlen = 0;
 
         if (n == -1) {
             perror("recvfrom");
@@ -189,7 +355,7 @@ main () {
             parse_ipv6(buf + ethhdrlen, n - ethhdrlen);
         } else {
             // printf("non-ip %x\n", ntohs(eth->h_proto));
-            // drop packet
+            // ignore packet:
             continue;
         }
     }
@@ -429,7 +595,7 @@ parse_dht_rpc (uint8_t *payload, int len) {
 
     int tid = payload[2] + (payload[3] << 8);
 
-    output("%15s:%d -> %15s:%d tid=%4x %s", source_name, ntohs(udp->source), dest_name, ntohs(udp->dest), tid, request ? "REQ  " : "RESP ");
+    output("dht-rpc %15s:%d -> %15s:%d tid=%4x %s", source_name, ntohs(udp->source), dest_name, ntohs(udp->dest), tid, request ? "REQ  " : "RESP ");
 
     char addr[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET, &payload[4], addr, sizeof(addr));
@@ -660,21 +826,58 @@ parse_udx (uint8_t *payload, int len) {
     payload = (uint8_t *) i;
     len -= 20;
 
-    int n = snprintf(line, sizeof(line_buf) - linelen, "%15s:%d -> %15s:%d %8x seq=%10u ack=%10u", source_name, ntohs(udp->source), dest_name, ntohs(udp->dest), id, seq, ack);
-    line += n;
-    linelen += n;
+    output("udx %15s:%d -> %15s:%d %8x seq=%10u ack=%10u", source_name, ntohs(udp->source), dest_name, ntohs(udp->dest), id, seq, ack);
+
+    int _flags = flags;
 
     bool is_ack = (flags == 0);
+    output(" ");
+    if (is_ack) {
+        output("ACK");
+    } else {
+        if (_flags & UDX_HEADER_DATA) {
+            output("DATA");
+            _flags &= ~UDX_HEADER_DATA;
+            if (_flags) {
+                output("|");
+            }
+        }
+        if (_flags & UDX_HEADER_END) {
+            output("END");
+            _flags &= ~UDX_HEADER_END;
+            if (_flags) {
+                output("|");
+            }
+        }
+        if (_flags & UDX_HEADER_SACK) {
+            output("SACK");
+            _flags &= ~UDX_HEADER_SACK;
+            if (_flags) {
+                output("|");
+            }
+        }
+        if (_flags & UDX_HEADER_MESSAGE) {
+            // message is probably mutually exclusive in practice with the other _flags, but it's ok
+            output("MESSAGE");
+            _flags &= ~UDX_HEADER_MESSAGE;
+            if (_flags) {
+                output("|");
+            }
+        }
+        if (_flags & UDX_HEADER_DESTROY) {
+            output("DESTROY");
+            _flags &= ~UDX_HEADER_DESTROY;
+            if (_flags) {
+                output_suffix("(weird flag set, flags=%x)", flags);
+            }
+        }
+    }
 
     bool data = flags & UDX_HEADER_DATA;
     bool end = flags & UDX_HEADER_END;
     bool sack = flags & UDX_HEADER_SACK;
     bool message = flags & UDX_HEADER_MESSAGE;
     bool destroy = flags & UDX_HEADER_DESTROY;
-
-    n = snprintf(line, sizeof(line_buf) - linelen, " %s%s%s%s", is_ack ? "ACK" : "", data ? "DATA" : "", end ? "END" : "", sack ? "SACK" : " ");
-    line += n;
-    linelen += n;
 
     if (sack) {
         assert((data_offset % 8) == 0);
@@ -687,14 +890,40 @@ parse_udx (uint8_t *payload, int len) {
     payload += data_offset;
     len -= data_offset;
 
-    udx_flow_t *flow = lookup_or_create_flow(id);
+    udx_stream_t *stream = lookup(source_name, ntohs(udp->source), dest_name, ntohs(udp->dest), id);
+    udx_flow_t *flow = stream->flow[0].id == id ? &stream->flow[0] : &stream->flow[1];
+
+    if (data) {
+        if (stream->flow[0].id == id) {
+            stream->fwd = &stream->flow[0];
+            stream->rev = &stream->flow[1];
+        } else {
+            stream->fwd = &stream->flow[1];
+            stream->rev = &stream->flow[0];
+        }
+    }
+
+    if (data && seq != stream->fwd->seq + 1) {
+        // should be seq_le, account for sequence wrap
+        if (seq < stream->fwd->seq + 1) {
+            stream->fwd->retransmits++;
+            output_suffix("\t(retransmit)");
+        }
+        if (seq > stream->fwd->seq + 1) {
+            output_suffix("\t OOO sequece. maybe dropped packets: %d", seq - stream->fwd->seq);
+        }
+    }
 
     flow->seq = seq;
     flow->ack = ack;
     flow->rwnd = rwnd;
 
-    if (data) {
+    if (stream->fwd && stream->rev) {
+        int inflight = stream->fwd->seq - (stream->rev->ack - 1);
+        // output(" inflight=%d", inflight);
+    }
 
+    if (data && opts.print_packet_bytes) {
         for (int i = 0; i < len; i++) {
             if (i % 16 == 0) {
                 output("\n\t");
