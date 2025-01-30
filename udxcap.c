@@ -27,6 +27,8 @@ struct sockaddr_storage dest;
 char source_name[INET6_ADDRSTRLEN];
 char dest_name[INET6_ADDRSTRLEN];
 
+struct timeval packet_time;
+
 eth_hdr_t *eth;
 ip4_hdr_t *ip4;
 ip6_hdr_t *ip6;
@@ -52,6 +54,7 @@ struct {
     char *read_file;         // '-r' option, NULL if not provided.
     bool print_packet_bytes; // '-v' option
     char *filter;            // NULL if not provided, pointers to an argv if -f is used or to the 'filter' global if a filter is constructed from position arguments
+    bool generate_graphs;    // '-g' option
 } opts;
 
 void
@@ -115,10 +118,20 @@ struct udx_flow_s {
     bool complete; // we have seen the remote id in this direction
     uint32_t id;
 
+    // data for a 1-second slice of time
     uint32_t next_seq; // expected sequence
     uint32_t seq;
     uint32_t ack;
     uint32_t rwnd;
+
+    struct timeval start_time; // tv_sec, tv_usec
+    struct timeval time;       // time of last packet
+
+    FILE *graph_file;
+    // when the clock second-hand rolls over write
+    // these data into the graph_file
+    uint64_t packets_this_second;
+    uint64_t bytes_this_second;
 
     int retransmits;
 
@@ -289,6 +302,7 @@ void
 parse_udx (const uint8_t *payload, int len);
 
 int dlt;
+int packet_byte_size;
 
 void
 on_packet (u_char *ctx, const struct pcap_pkthdr *header, const u_char *payload) {
@@ -299,6 +313,8 @@ on_packet (u_char *ctx, const struct pcap_pkthdr *header, const u_char *payload)
     prefixlen = 0;
     suffix = suffix_buf;
     suffixlen = 0;
+
+    packet_byte_size = header->len;
 
     if (header->caplen < header->len) {
         printf("dropping incomplete packet caplen=%d len=%d\n", header->caplen, header->len);
@@ -324,6 +340,8 @@ on_packet (u_char *ctx, const struct pcap_pkthdr *header, const u_char *payload)
         printf("proto=%d apphdr_type=%d\n", proto, arphrd_type);
     }
 
+    packet_time = header->ts;
+
     if (proto == 0x800) {
         parse_ipv4(payload + llhdr_size, header->len - llhdr_size);
     } else if (proto == 0x86dd) {
@@ -334,6 +352,8 @@ on_packet (u_char *ctx, const struct pcap_pkthdr *header, const u_char *payload)
 
     return;
 }
+
+/*
 void
 parse_filter (int arg1, int argc, char **argv) {
     printf("parse filter, %d %d arg=%s\n", arg1, argc, argv[arg1]);
@@ -353,10 +373,13 @@ parse_filter (int arg1, int argc, char **argv) {
     printf("filter=%.*s\n", filter_sz, filter);
     opts.filter = filter;
 }
+*/
 
 int
 main (int argc, char **argv) {
     int current_option = 0; // option being parsed
+
+    opts.filter = "udp"; // default - at least filter out non-udp traffic
 
     opts.print_packet_bytes = false;
     for (int i = 1; i < argc; i++) {
@@ -373,6 +396,10 @@ main (int argc, char **argv) {
             continue;
         case 'r':
             opts.read_file = arg;
+            current_option = 0;
+            continue;
+        case 'f':
+            opts.filter = arg;
             current_option = 0;
             continue;
         default:
@@ -392,9 +419,17 @@ main (int argc, char **argv) {
                 current_option = 'r';
                 continue;
             }
+            if (arg[1] == 'f') {
+                current_option = 'f';
+                continue;
+            }
+            if (arg[1] == 'g') {
+                opts.generate_graphs = true;
+                continue;
+            }
         }
-        parse_filter(i, argc, argv);
-        break;
+        fprintf(stderr, "unknown option '%s'\n", arg);
+        return 1;
     }
 
     int rc;
@@ -467,6 +502,18 @@ main (int argc, char **argv) {
     if (rc != 0) {
         fprintf(stderr, "pcap loop\n");
         return 1;
+    }
+
+    if (opts.generate_graphs) {
+        // just iterate the hash table
+        for (int i = 0; i < HASH_SIZE; i++) {
+            udx_stream_t *s = stream_table[i];
+            while (s != NULL) {
+                if (s->flow[0].graph_file) fclose(s->flow[0].graph_file);
+                if (s->flow[1].graph_file) fclose(s->flow[1].graph_file);
+                s = s->hash_next;
+            }
+        }
     }
 
     return 0;
@@ -685,6 +732,9 @@ print_bytes (uint8_t *p, int len) {
 
 void
 parse_dht_rpc (const uint8_t *payload, int len) {
+
+    output("%ld.%06ld ", packet_time.tv_sec, packet_time.tv_usec);
+
     bool request = !(payload[0] & 0x10);
 
     int version = payload[0] & 0x0f;
@@ -692,7 +742,7 @@ parse_dht_rpc (const uint8_t *payload, int len) {
 
     int tid = payload[2] + (payload[3] << 8);
 
-    output("dht-rpc %15s:%d -> %15s:%d tid=%4x %s", source_name, ntohs(udp->sport), dest_name, ntohs(udp->dport), tid, request ? "REQ  " : "RESP ");
+    output("%15s:%d -> %15s:%d DHT-RPC tid=%5d %s", source_name, ntohs(udp->sport), dest_name, ntohs(udp->dport), tid, request ? "REQ  " : "RESP ");
 
     char addr[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET, &payload[4], addr, sizeof(addr));
@@ -912,6 +962,9 @@ parse_appl (const uint8_t *payload, int len) {
 
 void
 parse_udx (const uint8_t *payload, int len) {
+
+    output("%ld.%06ld ", packet_time.tv_sec, packet_time.tv_usec);
+
     uint8_t *p = payload;
 
     int magic = *p++;
@@ -929,7 +982,7 @@ parse_udx (const uint8_t *payload, int len) {
     payload = (uint8_t *) i;
     len -= 20;
 
-    output("udx %15s:%d -> %15s:%d id=%u seq=%u ack=%u", source_name, ntohs(udp->sport), dest_name, ntohs(udp->dport), id, seq, ack);
+    output("%15s:%d -> %15s:%d UDX id=%u seq=%u ack=%u", source_name, ntohs(udp->sport), dest_name, ntohs(udp->dport), id, seq, ack);
 
     int _flags = flags;
 
@@ -1008,6 +1061,32 @@ parse_udx (const uint8_t *payload, int len) {
             stream->rev = &stream->flow[0];
         }
     }
+
+    if (flow->start_time.tv_sec == 0) {
+        flow->start_time = packet_time;
+        flow->time = packet_time;
+    }
+
+    if (opts.generate_graphs) {
+        if (flow->graph_file == NULL) {
+            char filename[120];
+            snprintf(filename, 120, "%s:%d_%s:%d_%u.dat", source_name, ntohs(udp->sport), dest_name, ntohs(udp->dport), id);
+            flow->graph_file = fopen(filename, "w+");
+        }
+        if (flow->graph_file && flow->time.tv_sec < packet_time.tv_sec) {
+            fprintf(flow->graph_file, "%ld %ld %ld\n", flow->time.tv_sec - flow->start_time.tv_sec, flow->packets_this_second, flow->bytes_this_second);
+            if (!opts.read_file) {
+                // if user is live, flush as we go since they'll probably end with SIGINT
+                fflush(flow->graph_file);
+            }
+            flow->packets_this_second = 0;
+            flow->bytes_this_second = 0;
+        }
+    }
+
+    flow->time = packet_time;
+    flow->packets_this_second++;
+    flow->bytes_this_second += packet_byte_size;
 
     if (data && seq != stream->fwd->next_seq) {
         // should be seq_le, account for sequence wrap
