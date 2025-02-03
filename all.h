@@ -20,6 +20,14 @@ typedef struct {
     uint8_t packet_type;
     uint8_t link_layer_addrlen;
     uint8_t link_layer_addr[8];
+} sll2_hdr_t;
+
+typedef struct {
+    uint16_t packet_type;
+    uint16_t arphrd_type;
+    uint16_t link_layer_addrlen;
+    uint8_t link_layer_addr[8];
+    uint16_t protocol_type;
 } sll_hdr_t;
 
 typedef struct {
@@ -73,19 +81,16 @@ typedef struct {
     udx_packet_t **values;
 } udx_cirbuf_t;
 
-void
-udx__cirbuf_init (udx_cirbuf_t *c, uint32_t initial_size);
+void udx__cirbuf_init(udx_cirbuf_t *c, uint32_t initial_size);
 
-void
-udx__cirbuf_destroy (udx_cirbuf_t *c);
+void udx__cirbuf_destroy(udx_cirbuf_t *c);
 
-void
-udx__cirbuf_set (udx_cirbuf_t *c, udx_packet_t *val);
+void udx__cirbuf_set(udx_cirbuf_t *c, udx_packet_t *val);
 
 udx_packet_t *
-udx__cirbuf_get (udx_cirbuf_t *c, uint32_t seq);
+udx__cirbuf_get(udx_cirbuf_t *c, uint32_t seq);
 
 udx_packet_t *
-udx__cirbuf_remove (udx_cirbuf_t *c, uint32_t seq);
+udx__cirbuf_remove(udx_cirbuf_t *c, uint32_t seq);
 
 #endif // all_h_INCLUDED
