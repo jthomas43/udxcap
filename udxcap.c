@@ -57,7 +57,8 @@ struct {
     bool generate_graphs;    // '-g' option
 } opts;
 
-void output(char *fmt, ...) {
+void
+output (char *fmt, ...) {
     va_list ap;
 
     va_start(ap, fmt);
@@ -68,7 +69,8 @@ void output(char *fmt, ...) {
     va_end(ap);
 }
 
-void output_prefix(char *fmt, ...) {
+void
+output_prefix (char *fmt, ...) {
     va_list ap;
 
     va_start(ap, fmt);
@@ -78,7 +80,8 @@ void output_prefix(char *fmt, ...) {
     va_end(ap);
 }
 
-void output_suffix(char *fmt, ...) {
+void
+output_suffix (char *fmt, ...) {
     va_list ap;
 
     va_start(ap, fmt);
@@ -88,7 +91,8 @@ void output_suffix(char *fmt, ...) {
     va_end(ap);
 }
 
-void final_output() {
+void
+final_output () {
     if (prefixlen) {
         printf("%.*s\n", prefixlen, prefix_buf);
     }
@@ -157,7 +161,8 @@ struct udx_stream_s {
 #define HASH_SIZE 1024
 udx_stream_t *stream_table[HASH_SIZE];
 
-bool stream_equal(udx_stream_t *stream, char *saddr, uint16_t sport, char *daddr, uint16_t dport, uint32_t remote_id) {
+bool
+stream_equal (udx_stream_t *stream, char *saddr, uint16_t sport, char *daddr, uint16_t dport, uint32_t remote_id) {
 
     if (strcmp(saddr, daddr) < 0 ||
         (strcmp(saddr, daddr) == 0 && sport < dport)) {
@@ -196,7 +201,7 @@ bool stream_equal(udx_stream_t *stream, char *saddr, uint16_t sport, char *daddr
 // so that they are not promoted to signed int by the hash
 // function. important!
 udx_stream_t *
-lookup(char *saddr, uint32_t sport, char *daddr, uint32_t dport, uint32_t id) {
+lookup (char *saddr, uint32_t sport, char *daddr, uint32_t dport, uint32_t id) {
     uint32_t key;
 
     if (sport < dport) {
@@ -264,7 +269,7 @@ struct dht_request_s {
 dht_request_t *pending[HASH_SIZE];
 
 dht_request_t **
-find_dht_request(int tid) {
+find_dht_request (int tid) {
     dht_request_t **p = &pending[tid & (HASH_SIZE - 1)];
 
     while (*p != NULL) {
@@ -277,7 +282,7 @@ find_dht_request(int tid) {
     return p;
 }
 dht_request_t *
-find_or_create_dht_request(int tid) {
+find_or_create_dht_request (int tid) {
     dht_request_t **p = find_dht_request(tid);
 
     if (*p == NULL) {
@@ -289,16 +294,22 @@ find_or_create_dht_request(int tid) {
 }
 
 // each parsing function passes a payload to the start of it's header
-void parse_ipv4(const uint8_t *payload, int len);
-void parse_ipv6(const uint8_t *payload, int len);
-void parse_udp(const uint8_t *payload, int len);
-void parse_appl(const uint8_t *payload, int len);
-void parse_udx(const uint8_t *payload, int len);
+void
+parse_ipv4 (const uint8_t *payload, int len);
+void
+parse_ipv6 (const uint8_t *payload, int len);
+void
+parse_udp (const uint8_t *payload, int len);
+void
+parse_appl (const uint8_t *payload, int len);
+void
+parse_udx (const uint8_t *payload, int len);
 
 int dlt;
 int packet_byte_size;
 
-void on_packet(u_char *ctx, const struct pcap_pkthdr *header, const u_char *payload) {
+void
+on_packet (u_char *ctx, const struct pcap_pkthdr *header, const u_char *payload) {
 
     line = line_buf;
     linelen = 0;
@@ -317,14 +328,14 @@ void on_packet(u_char *ctx, const struct pcap_pkthdr *header, const u_char *payl
     int llhdr_size;
     if (dlt == DLT_EN10MB) {
 
-        eth = (eth_hdr_t *)payload;
+        eth = (eth_hdr_t *) payload;
 
         proto = htons(eth->ether_type);
 
         llhdr_size = sizeof(eth_hdr_t);
 
     } else if (dlt == DLT_LINUX_SLL2) {
-        sll2_hdr_t *sll = (sll2_hdr_t *)payload;
+        sll2_hdr_t *sll = (sll2_hdr_t *) payload;
 
         int arphrd_type = ntohs(sll->arphrd_type);
 
@@ -332,7 +343,7 @@ void on_packet(u_char *ctx, const struct pcap_pkthdr *header, const u_char *payl
         llhdr_size = sizeof(sll2_hdr_t);
         printf("proto=%d apphdr_type=%d\n", proto, arphrd_type);
     } else if (dlt == DLT_LINUX_SLL) {
-        sll_hdr_t *sll = (sll_hdr_t *)payload;
+        sll_hdr_t *sll = (sll_hdr_t *) payload;
 
         int arphrd_type = ntohs(sll->arphrd_type);
 
@@ -378,7 +389,8 @@ parse_filter (int arg1, int argc, char **argv) {
 }
 */
 
-int main(int argc, char **argv) {
+int
+main (int argc, char **argv) {
     int current_option = 0; // option being parsed
 
     opts.filter = "udp"; // default - at least filter out non-udp traffic
@@ -523,8 +535,9 @@ int main(int argc, char **argv) {
     return 0;
 }
 
-void parse_ipv4(const uint8_t *payload, int len) {
-    ip4 = (ip4_hdr_t *)payload;
+void
+parse_ipv4 (const uint8_t *payload, int len) {
+    ip4 = (ip4_hdr_t *) payload;
     ip6 = NULL;
 
     int version = ip4->v_and_hl >> 4;
@@ -533,8 +546,8 @@ void parse_ipv4(const uint8_t *payload, int len) {
     memset(&dest, 0, sizeof(dest));
 
     assert(version == 4);
-    struct sockaddr_in *saddr = (struct sockaddr_in *)&source;
-    struct sockaddr_in *daddr = (struct sockaddr_in *)&dest;
+    struct sockaddr_in *saddr = (struct sockaddr_in *) &source;
+    struct sockaddr_in *daddr = (struct sockaddr_in *) &dest;
     saddr->sin_addr.s_addr = ip4->saddr;
     daddr->sin_addr.s_addr = ip4->daddr;
 
@@ -562,15 +575,16 @@ void parse_ipv4(const uint8_t *payload, int len) {
     parse_udp(payload + ip_header_len_bytes, ipv4_len - ip_header_len_bytes);
 }
 
-void parse_ipv6(const uint8_t *payload, int len) {
+void
+parse_ipv6 (const uint8_t *payload, int len) {
     ip4 = NULL;
-    ip6 = (ip6_hdr_t *)payload;
+    ip6 = (ip6_hdr_t *) payload;
 
     memset(&source, 0, sizeof(source));
     memset(&dest, 0, sizeof(dest));
 
-    struct sockaddr_in6 *saddr = (struct sockaddr_in6 *)&source;
-    struct sockaddr_in6 *daddr = (struct sockaddr_in6 *)&dest;
+    struct sockaddr_in6 *saddr = (struct sockaddr_in6 *) &source;
+    struct sockaddr_in6 *daddr = (struct sockaddr_in6 *) &dest;
 
     memcpy(&saddr->sin6_addr, &ip6->src, 16);
     memcpy(&daddr->sin6_addr, &ip6->dst, 16);
@@ -588,8 +602,9 @@ void parse_ipv6(const uint8_t *payload, int len) {
     parse_udp(payload + sizeof(ip6_hdr_t), len - payload_len);
 }
 
-void parse_udp(const uint8_t *payload, int len) {
-    udp = (udp_hdr_t *)payload;
+void
+parse_udp (const uint8_t *payload, int len) {
+    udp = (udp_hdr_t *) payload;
 
     parse_appl(payload + sizeof(udp_hdr_t), len - sizeof(udp_hdr_t));
 }
@@ -623,12 +638,12 @@ typedef enum {
     HYPERDHT_CMD_IMMUTABLE_GET
 } dht_hyperdht_command_type_t;
 
-#define DHT_FLAG_ID 0b00001
-#define DHT_FLAG_TOKEN 0b00010
+#define DHT_FLAG_ID       0b00001
+#define DHT_FLAG_TOKEN    0b00010
 #define DHT_FLAG_INTERNAL 0b00100
-#define DHT_FLAG_TARGET 0b01000 // request only
-#define DHT_FLAG_ERROR 0b01000  // response only
-#define DHT_FLAG_VALUE 0b10000
+#define DHT_FLAG_TARGET   0b01000 // request only
+#define DHT_FLAG_ERROR    0b01000 // response only
+#define DHT_FLAG_VALUE    0b10000
 
 char *hyperdht_command[] = {"PEER_HANDSHAKE", "PEER_HOLEPUNCH", "FIND_PEER", "LOOKUP", "ANNOUNCE", "UNANNOUNCE", "MUTABLE_PUT", "MUTABLE_GET", "IMMUTABLE_PUT", "IMMUTABLE_GET"};
 
@@ -645,9 +660,9 @@ typedef struct {
 } compact_uint_t;
 
 uint64_t
-decode_compact_integer(uint8_t **payload, int *len) {
+decode_compact_integer (uint8_t **payload) {
     uint8_t *p = *payload;
-    uint64_t value = *p;
+    uint64_t value = *p++;
     int nbytes = 0;
 
     if (value > 0xfc) {
@@ -665,15 +680,13 @@ decode_compact_integer(uint8_t **payload, int *len) {
     }
 
     *payload = p;
-    *len -= nbytes + 1;
 
     return value;
 }
 
-void decode_noise(uint8_t **payload, int *plen) {
-    assert(*plen >= 4);
-
-    int len = *plen;
+void
+decode_noise (uint8_t **payload, int len) {
+    assert(len >= 4);
 
     uint8_t *p = *payload;
 
@@ -681,31 +694,30 @@ void decode_noise(uint8_t **payload, int *plen) {
     int flags = *p++;
     int error = *p++;
     int firewall = *p++;
-    len += 4;
 
     if (flags & 0x01) {
-        uint64_t id = decode_compact_integer(&p, &len);
+        uint64_t id = decode_compact_integer(&p);
         output("id=%" PRIu64, id);
     }
     if (flags & 0x02) {
-        uint64_t value = decode_compact_integer(&p, &len);
+        uint64_t value = decode_compact_integer(&p);
         p += 6 * value;
         output("IPv4 ");
     }
     if (flags & 0x04) {
-        uint64_t value = decode_compact_integer(&p, &len);
+        uint64_t value = decode_compact_integer(&p);
         p += 18 * value;
         output("IPv6 ");
     }
     if (flags & 0x08) {
         int version = *p++;
         int features = *p++;
-        uint32_t id = decode_compact_integer(&p, &len);
-        uint32_t seq = decode_compact_integer(&p, &len);
+        uint32_t id = decode_compact_integer(&p);
+        uint32_t seq = decode_compact_integer(&p);
         output("version=%d features=%d id=%u, seq=%u ", version, features, id, seq);
     }
     if (flags & 0x16) {
-        uint64_t secret_stream_state = decode_compact_integer(&p, &len);
+        uint64_t secret_stream_state = decode_compact_integer(&p);
         output("Secret Stream State=% " PRIu64, secret_stream_state);
     }
     if (flags & 0x32) {
@@ -717,18 +729,21 @@ void decode_noise(uint8_t **payload, int *plen) {
         uint8_t *token_32 = p;
         p += 32;
     }
-    *plen -= (p - *payload);
     *payload = p;
     return;
 }
 
-void print_bytes(uint8_t *p, int len) {
+void
+print_bytes (uint8_t *p, int len) {
     for (int i = 0; i < len; i++) {
         output("%02x", *p++);
     }
 }
 
-void parse_dht_rpc(const uint8_t *payload, int len) {
+void
+parse_dht_rpc (const uint8_t *payload, int len) {
+
+    const uint8_t *p_init = payload;
 
     output("%ld.%06ld ", packet_time.tv_sec, packet_time.tv_usec);
 
@@ -752,14 +767,12 @@ void parse_dht_rpc(const uint8_t *payload, int len) {
     int port = payload[8] + (payload[9] << 8);
     output("%15s:%d ", addr, port);
 
-    uint8_t *p = (uint8_t *)&payload[10];
-    len -= 10;
+    uint8_t *p = (uint8_t *) &payload[10];
 
     if (flags & DHT_FLAG_ID) {
         output("id=");
         print_bytes(p, 32);
         p += 32;
-        len -= 32;
         output(" ");
     }
 
@@ -767,13 +780,18 @@ void parse_dht_rpc(const uint8_t *payload, int len) {
         output("token=");
         print_bytes(p, 32);
         p += 32;
-        len -= 32;
         output(" ");
     }
 
     if (request) {
+        if (flags & DHT_FLAG_TARGET) {
+            output("target=");
+            print_bytes(p, 32);
+            p += 32;
+            output(" ");
+        }
 
-        uint64_t command = decode_compact_integer(&p, &len);
+        uint64_t command = decode_compact_integer(&p);
         bool internal = flags & DHT_FLAG_INTERNAL;
 
         if (command > 8 || (internal && command > 4)) {
@@ -793,7 +811,6 @@ void parse_dht_rpc(const uint8_t *payload, int len) {
             if (command == HYPERDHT_CMD_PEER_HANDSHAKE) {
                 int flags = *p++;
                 int mode = *p++;
-                len -= 2;
                 printf("flags=%d mode=%d\n", flags, mode);
 
                 char *mode_str = "unknown";
@@ -811,8 +828,8 @@ void parse_dht_rpc(const uint8_t *payload, int len) {
                     mode_str = modes[mode];
                 }
 
-                output("%s %s mode=%s (%d)", flags & 0x01 ? "PEER ADDRESS" : "", flags & 0x02 ? "+Relay Address" : "", mode_str, mode);
-                // decode_noise(&p, &len);
+                output("%s %s mode=%s (%d)", flags & 0x01 ? " +peer address" : "", flags & 0x02 ? "+Relay Address" : "", mode_str, mode);
+                // decode_noise(&p);
 
                 // if (flags & 0x01 /* peer address */) {
                 //     uint32_t address = 0;
@@ -838,10 +855,9 @@ void parse_dht_rpc(const uint8_t *payload, int len) {
                 // exports.holepunch is the request?
                 int flags = *p++;
                 int mode = *p++;
-                len -= 2;
-                uint32_t id = decode_compact_integer(&p, &len);
+                uint32_t id = decode_compact_integer(&p);
                 output("flags=%d mode=%d id=%u", flags, mode, id);
-                int arraylen = decode_compact_integer(&p, &len);
+                int arraylen = decode_compact_integer(&p);
             }
         }
     } else {
@@ -930,21 +946,21 @@ void parse_dht_rpc(const uint8_t *payload, int len) {
         }
     }
 
-    len -= (p - payload);
-    payload = p;
-
     if (flags & DHT_FLAG_VALUE) {
-        for (int i = 0; i < len; i++) {
+        int i = 0;
+        while (p < p_init + len) {
             if (i % 16 == 0) {
                 output("\n\t");
             }
-            output("%02x ", payload[i]);
+            output("%02x ", *p++);
+            i++;
         }
     }
 
     final_output();
 }
-void parse_appl(const uint8_t *payload, int len) {
+void
+parse_appl (const uint8_t *payload, int len) {
     if (len >= 20 && payload[0] == 0xff && payload[1] == 1) {
         parse_udx(payload, len);
     } else if (len > 1 && (payload[0] == 3 || payload[0] == 19)) {
@@ -955,31 +971,32 @@ void parse_appl(const uint8_t *payload, int len) {
     return;
 }
 
-#define UDX_HEADER_DATA 0b00001
-#define UDX_HEADER_END 0b00010
-#define UDX_HEADER_SACK 0b00100
+#define UDX_HEADER_DATA    0b00001
+#define UDX_HEADER_END     0b00010
+#define UDX_HEADER_SACK    0b00100
 #define UDX_HEADER_MESSAGE 0b01000
 #define UDX_HEADER_DESTROY 0b10000
 
-void parse_udx(const uint8_t *payload, int len) {
+void
+parse_udx (const uint8_t *payload, int len) {
 
     output("%ld.%06ld ", packet_time.tv_sec, packet_time.tv_usec);
 
-    uint8_t *p = (uint8_t *)payload;
+    uint8_t *p = (uint8_t *) payload;
 
     int magic = *p++;
     int udx_version = *p++;
     int flags = *p++;
     int data_offset = *p++;
 
-    uint32_t *i = (uint32_t *)p;
+    uint32_t *i = (uint32_t *) p;
 
     uint32_t id = *i++;
     uint32_t rwnd = *i++;
     uint32_t seq = *i++;
     uint32_t ack = *i++;
 
-    payload = (uint8_t *)i;
+    payload = (uint8_t *) i;
     len -= 20;
 
     output("%15s:%d -> %15s:%d UDX id=%10u seq=%u ack=%u", source_name, ntohs(udp->sport), dest_name, ntohs(udp->dport), id, seq, ack);
