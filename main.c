@@ -35,20 +35,9 @@ ip4_hdr_t *ip4;
 ip6_hdr_t *ip6;
 udp_hdr_t *udp;
 
-// output is grouped into triplets of lines: a prefix, the line itself, and a
-// suffix. output_prefix(), output(), and output_suffix() are used to write to
-// these buffers.
 char line_buf[0x4000];
 char *line;
-int linelen;
-
-char prefix_buf[0x4000];
-char *prefix;
-int prefixlen;
-
-char suffix_buf[0x4000];
-char *suffix;
-int suffixlen;
+int line_len;
 
 struct {
     char *interface;         // e.g. 'eth0', NULL if not provided.
@@ -63,51 +52,11 @@ output (char *fmt, ...) {
     va_list ap;
 
     va_start(ap, fmt);
-    linelen += vsnprintf(line, sizeof(line_buf) - linelen, fmt, ap);
-    assert(linelen >= 0);
-    line = line_buf + linelen;
+    line_len += vsnprintf(line, sizeof(line_buf) - line_len, fmt, ap);
+    assert(line_len >= 0);
+    line = line_buf + line_len;
 
     va_end(ap);
-}
-
-void
-output_prefix (char *fmt, ...) {
-    va_list ap;
-
-    va_start(ap, fmt);
-    prefixlen += vsnprintf(prefix, sizeof(prefix_buf) - prefixlen, fmt, ap);
-    prefix = prefix_buf + prefixlen;
-
-    va_end(ap);
-}
-
-void
-output_suffix (char *fmt, ...) {
-    va_list ap;
-
-    va_start(ap, fmt);
-    suffixlen += vsnprintf(suffix, sizeof(suffix_buf) - suffixlen, fmt, ap);
-    suffix = suffix_buf + suffixlen;
-
-    va_end(ap);
-}
-
-void
-final_output () {
-    if (prefixlen) {
-        printf("%.*s\n", prefixlen, prefix_buf);
-    }
-
-    if (linelen) {
-        printf("%.*s\n", linelen, line_buf);
-    }
-
-    if (suffixlen) {
-        printf("%.*s\n", suffixlen, suffix_buf);
-    }
-    prefixlen = 0;
-    linelen = 0;
-    suffixlen = 0;
 }
 
 typedef struct dht_request_s dht_request_t;
@@ -173,11 +122,7 @@ void
 on_packet (u_char *ctx, const struct pcap_pkthdr *header, const u_char *payload) {
 
     line = line_buf;
-    linelen = 0;
-    prefix = prefix_buf;
-    prefixlen = 0;
-    suffix = suffix_buf;
-    suffixlen = 0;
+    line_len = 0;
 
     packet_byte_size = header->len;
 
@@ -257,11 +202,11 @@ on_packet (u_char *ctx, const struct pcap_pkthdr *header, const u_char *payload)
 
     struct sockaddr *sa = (struct sockaddr *) &src;
     getnameinfo(sa, addr_sizeof(sa), host, sizeof(host), port, sizeof(port), NI_NUMERICHOST | NI_NUMERICSERV);
-    snprintf(srcstr, sizeof(srcstr), "%s:%s", host, port);
+    snprintf(srcstr, sizeof(srcstr), "%15s:%-6s", host, port);
 
     sa = (struct sockaddr *) &dst;
     getnameinfo(sa, addr_sizeof(sa), host, sizeof(host), port, sizeof(port), NI_NUMERICHOST | NI_NUMERICSERV);
-    snprintf(dststr, sizeof(dststr), "%s:%s", host, port);
+    snprintf(dststr, sizeof(dststr), "%15s:%-6s", host, port);
 
     payload += n;
     len -= n;
@@ -531,12 +476,25 @@ typedef enum {
     HYPERDHT_CMD_IMMUTABLE_GET
 } dht_hyperdht_command_type_t;
 
-#define DHT_FLAG_ID       0b00001
-#define DHT_FLAG_TOKEN    0b00010
-#define DHT_FLAG_INTERNAL 0b00100
-#define DHT_FLAG_TARGET   0b01000 // request only
-#define DHT_FLAG_ERROR    0b01000 // response only
-#define DHT_FLAG_VALUE    0b10000
+typedef enum {
+    DHT_REQ_FLAG_ID = 1,
+    DHT_REQ_FLAG_TOKEN = 2,
+    DHT_REQ_FLAG_INTERNAL = 4,
+    DHT_REQ_FLAG_TARGET = 8,
+    DHT_REQ_FLAG_VALUE = 16
+} dht_request_flag_t;
+
+typedef enum {
+    DHT_RESP_FLAG_ID = 1,
+    DHT_RESP_FLAG_TOKEN = 2,
+    DHT_RESP_FLAG_CLOSER_NODES = 4,
+    DHT_RESP_FLAG_ERROR = 8,
+    DHT_RESP_FLAG_VALUE = 16
+} dht_response_flag_t;
+
+#define DHT_FLAG_ID    0b00001
+#define DHT_FLAG_TOKEN 0b00010
+#define DHT_FLAG_VALUE 0b10000
 
 char *hyperdht_command[] = {"PEER_HANDSHAKE", "PEER_HOLEPUNCH", "FIND_PEER", "LOOKUP", "ANNOUNCE", "UNANNOUNCE", "MUTABLE_PUT", "MUTABLE_GET", "IMMUTABLE_PUT", "IMMUTABLE_GET"};
 
@@ -677,17 +635,19 @@ parse_dht_rpc (const uint8_t *payload, int len) {
     }
 
     if (request) {
-        if (flags & DHT_FLAG_TARGET) {
+        uint64_t command = decode_compact_integer(&p);
+
+        if (flags & DHT_REQ_FLAG_TARGET) {
             output("target=");
             print_bytes(p, 32);
             p += 32;
             output(" ");
         }
 
-        uint64_t command = decode_compact_integer(&p);
-        bool internal = flags & DHT_FLAG_INTERNAL;
+        bool internal = flags & DHT_REQ_FLAG_INTERNAL;
 
         if (command > 8 || (internal && command > 4)) {
+            __builtin_trap();
             printf("bad command? command=%" PRIu64 "\n", command);
             return;
         }
@@ -764,51 +724,22 @@ parse_dht_rpc (const uint8_t *payload, int len) {
             free(*preq);
         }
 
-        // reply (flag is 0x4.. not sure i that's necessarily internal or what
-        if (flags & DHT_FLAG_INTERNAL) {
-            uint64_t count = *p++;
-
-            if (count > 0xfc) {
-                count = 0;
-                int nbytes = 0;
-                if (count == 0xfd)
-                    nbytes = 2;
-                if (count == 0xfe)
-                    nbytes = 4;
-                if (count == 0xff)
-                    nbytes = 8;
-
-                for (int i = 0; i < nbytes; i++) {
-                    count = (count << 8) + *p++;
-                }
-            }
+        if (flags & DHT_RESP_FLAG_CLOSER_NODES) {
+            uint64_t count = decode_compact_integer(&p);
+            output("\ncloser nodes (%d):\n", count);
 
             for (int i = 0; i < count; i++) {
                 char addr[INET6_ADDRSTRLEN];
                 inet_ntop(AF_INET, p, addr, sizeof(addr));
                 p += 4;
-                port = p[0] + (p[1] << 8);
+                int port = p[0] + (p[1] << 8);
                 p += 2;
+                output("%4d: %15s:%-6d\n", i, addr, port);
             }
         }
 
-        if (flags & DHT_FLAG_ERROR) {
-            uint64_t error = *p++;
-
-            if (error > 0xfc) {
-                error = 0;
-                int nbytes = 0;
-                if (error == 0xfd)
-                    nbytes = 2;
-                if (error == 0xfe)
-                    nbytes = 4;
-                if (error == 0xff)
-                    nbytes = 8;
-
-                for (int i = 0; i < nbytes; i++) {
-                    error = (error << 8) + *p++;
-                }
-            }
+        if (flags & DHT_RESP_FLAG_ERROR) {
+            dht_rpc_error_t error = decode_compact_integer(&p);
 
             char *error_string = NULL;
 
@@ -850,7 +781,10 @@ parse_dht_rpc (const uint8_t *payload, int len) {
         }
     }
 
-    final_output();
+    if (line_len > 0) {
+        printf("%.*s\n", line_len, line_buf);
+        line_len = 0;
+    }
 }
 void
 parse_appl (const uint8_t *payload, int len) {
@@ -897,10 +831,11 @@ parse_udx (const uint8_t *payload, int len) {
     payload = (uint8_t *) i;
     len -= 20;
 
-    output("%s -> %s UDX id=%10u seq=%u ack=%u", srcstr, dststr, id, seq, ack);
+    output("%s -> %s UDX id=%10u seq=%10u ack=%10u", srcstr, dststr, id, seq, ack);
 
     int _flags = flags;
 
+    bool print_flags = false;
     bool is_ack = (flags == 0);
     output(" ");
     if (is_ack) {
@@ -940,7 +875,7 @@ parse_udx (const uint8_t *payload, int len) {
             output("DESTROY");
             _flags &= ~UDX_HEADER_DESTROY;
             if (_flags) {
-                output_suffix("(weird flag set, flags=%x)", flags);
+                print_flags = true;
             }
         }
     }
@@ -952,15 +887,20 @@ parse_udx (const uint8_t *payload, int len) {
     bool destroy = flags & UDX_HEADER_DESTROY;
 
     if (sack) {
-        assert((data_offset % 8) == 0);
-        for (int j = 0; j < data_offset; j += 8) {
-            output("%u:%u", i[0], i[1]);
+        int sack_len_bytes = (data_offset > 0) ? data_offset : len;
+        assert((sack_len_bytes % 8) == 0);
+        for (int j = 0; j < sack_len_bytes; j += 8) {
+            output(" %u:%u", i[0], i[1]);
             i += 2;
         }
     }
 
     payload += data_offset;
     len -= data_offset;
+
+    if (data) {
+        output(" Len=%d", len);
+    }
 
     udx_flow_t *flow = upsert_flow((struct sockaddr *) &src, (struct sockaddr *) &dst, id);
     udx_stream_t *stream = get_stream(flow);
@@ -990,14 +930,16 @@ parse_udx (const uint8_t *payload, int len) {
     flow->time = packet_time;
     flow->packets_this_second++;
     flow->bytes_this_second += packet_byte_size;
+    bool retransmit = false;
+    int ooo_dropped = 0;
 
     if (data && flow->next_seq_valid && seq != flow->next_seq) {
         // should be seq_le, account for sequence wrap
         if (seq_cmp(seq, flow->next_seq) < 0) {
             flow->stat.retransmits++;
-            output_suffix("\t(retransmit)");
+            retransmit = true;
         } else {
-            output_suffix("\t OOO sequence. maybe dropped packets: %d", seq - flow->seq);
+            ooo_dropped = seq - flow->seq;
         }
     }
 
@@ -1026,5 +968,19 @@ parse_udx (const uint8_t *payload, int len) {
         }
     }
 
-    final_output();
+    if (retransmit) {
+        output(" Retransmit");
+    }
+
+    if (print_flags) {
+        output("weird flags=%x)", flags);
+    }
+    if (ooo_dropped) {
+        output("\nmissing %u packets", ooo_dropped);
+    }
+
+    if (line_len > 0) {
+        printf("%.*s\n", line_len, line_buf);
+        line_len = 0;
+    }
 }
